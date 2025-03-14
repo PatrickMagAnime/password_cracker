@@ -1,86 +1,106 @@
 import string
 import time
-import itertools
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import tqdm
+import math
+from multiprocessing import Pool, cpu_count, Manager
+from tqdm import tqdm
 
-def check_password(candidate: str, target: str) -> bool:
-    return candidate == target
+def index_to_password(idx, charset, length):
+    password = []
+    cs_len = len(charset)
+    for _ in range(length):
+        idx, rem = divmod(idx, cs_len)
+        password.append(charset[rem])
+    return ''.join(reversed(password))
 
-def generate_passwords(charset, max_length):
-    for length in range(1, max_length + 1):
-        for pwd_tuple in itertools.product(charset, repeat=length):
-            yield ''.join(pwd_tuple)
-
-def chunk_generator(iterable, chunk_size):
-    it = iter(iterable)
-    while True:
-        chunk = list(itertools.islice(it, chunk_size))
-        if not chunk:
-            break
-        yield chunk
-
-def check_chunk(candidates, target):
-    for candidate in candidates:
-        if check_password(candidate, target):
-            return candidate
-    return None
+def check_range(args):
+    start, end, charset, length, target, found_flag = args
+    if found_flag.value:
+        return 0, 0
+    
+    cs_len = len(charset)
+    batch_size = 5000
+    tested = 0
+    
+    for idx in range(start, end + 1, batch_size):
+        if found_flag.value:
+            return tested, 0
+        
+        batch_end = min(idx + batch_size - 1, end)
+        tested += batch_end - idx + 1
+        
+        for i in range(idx, batch_end + 1):
+            if index_to_password(i, charset, length) == target:
+                found_flag.value = 1
+                return tested, 1
+    
+    return tested, 0
 
 def main():
-    target = input("Zielpasswort eingeben: ")
+    target = input("Zielpasswort: ")
     
-    print("Wähle Zeichensatz:")
-    print("1. Nur Zahlen")
-    print("2. Nur Buchstaben")
-    print("3. Buchstaben und Zahlen")
-    print("4. Buchstaben, Zahlen und Sonderzeichen")
-    option = input("Deine Wahl (1-4): ")
-    charset_options = {
+    print("\nZeichensatzauswahl:")
+    print("1. Nur Zahlen\n2. Nur Buchstaben\n3. Buchstaben + Zahlen\n4. Alle Zeichen")
+    charset = {
         '1': string.digits,
         '2': string.ascii_letters,
         '3': string.ascii_letters + string.digits,
-        '4': string.ascii_letters + string.digits + string.punctuation,
-    }
-    charset = charset_options.get(option, "")
+        '4': string.ascii_letters + string.digits + string.punctuation
+    }.get(input("Wahl (1-4): "), "")
+    
     if not charset:
-        print("Ungültige Wahl!")
+        print("Ungültige Eingabe!")
         return
-    charset = list(charset)
-    max_length = int(input("Maximale Passwortlänge: "))
-
-    total_combinations = sum(len(charset) ** i for i in range(1, max_length + 1))
+    
+    max_length = int(input("Maximale Länge: "))
+    charset = tuple(charset)
+    cs_len = len(charset)
+    total_combinations = sum(cs_len**l for l in range(1, max_length+1))
     
     start_time = time.time()
-    found_password = None
-    tested_count = 0
-    chunk_size = 1000 
-
-    password_gen = generate_passwords(charset, max_length)
+    manager = Manager()
+    found_flag = manager.Value('i', 0)
+    total_tested = 0
     
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        with tqdm.tqdm(total=total_combinations, desc="Teste Passwörter...", unit="pwd") as pbar:
-            futures = {executor.submit(check_chunk, chunk, target): len(chunk) for chunk in chunk_generator(password_gen, chunk_size)}
-            
-            for future in as_completed(futures):
-                result = future.result()
-                tested_count += futures[future]
-                pbar.update(futures[future])
-                elapsed = time.time() - start_time
-                pps = tested_count / elapsed if elapsed > 0 else 0
-                eta = (total_combinations - tested_count) / pps if pps > 0 else float('inf')
-                pbar.set_postfix({"pps": f"{pps:.2f}", "ETA": f"{eta:.2f}s"})
-                if result is not None:
-                    found_password = result
+    with tqdm(total=total_combinations, desc="Gesamtfortschritt", unit="pwd",
+             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]") as pbar:
+        with Pool(processes=cpu_count()) as pool:
+            for length in range(1, max_length + 1):
+                if found_flag.value:
                     break
+                
+                total = cs_len ** length
+                chunk_size = max(1000, total // (cpu_count() * 10))
+                chunks = []
+                
+                for start in range(0, total, chunk_size):
+                    end = min(start + chunk_size - 1, total - 1)
+                    chunks.append((
+                        start, 
+                        end, 
+                        charset, 
+                        length, 
+                        target, 
+                        found_flag
+                    ))
+                
+                results = pool.imap_unordered(check_range, chunks, chunksize=10)
+                
+                for tested, found in results:
+                    total_tested += tested
+                    pbar.update(tested)
+                    if found:
+                        found_flag.value = 1
+                        pool.terminate()
+                        break
 
-    elapsed_time = time.time() - start_time
-    print("\n--- Zusammenfassung ---")
-    print(f"Getestete Passwörter: {tested_count}")
-    print(f"Gesamtzeit: {elapsed_time:.2f} Sekunden")
-    if found_password:
-        print(f"Gefundenes Passwort: {found_password}")
-    else:
-        print("Kein Passwort gefunden.")
+    print("\n" + "="*50)
+    print(f"Passwort {'gefunden' if found_flag.value else 'nicht gefunden'}")
     
-if __name__ == '__main__':
+    if found_flag.value:
+        elapsed_time = time.time() - start_time
+        print(f"Gesamtzeit: {elapsed_time:.2f}s")
+        print(f"Getestete Passwörter: {total_tested}")
+        print(f"Durchschnittliche Geschwindigkeit: {total_tested / elapsed_time:,.0f} Passwörter/Sekunde")
+
+if __name__ == "__main__":
     main()
