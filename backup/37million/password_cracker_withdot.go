@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"math/big"
 	"os"
 	"runtime"
 	"strconv"
@@ -25,11 +24,10 @@ func indexToPassword(idx int, charset []rune, length int) string {
 }
 
 // Berechnet die Gesamtzahl der Kombinationen für eine gegebene Länge.
-func totalForLength(length int, csLen int) *big.Int {
-	total := big.NewInt(1)
-	csLenBig := big.NewInt(int64(csLen))
+func totalForLength(length, csLen int) int {
+	total := 1
 	for i := 0; i < length; i++ {
-		total.Mul(total, csLenBig)
+		total *= csLen
 	}
 	return total
 }
@@ -82,86 +80,11 @@ func formatNumber(number int64) string {
 	return out
 }
 
-// Berechnet die geschätzte Zeit basierend auf der Anzahl der Kombinationen und der Geschwindigkeit
-func calculateEstimatedTime(totalCombinations, speed *big.Int) (seconds, minutes, hours, days, years float64) {
-	totalCombinationsF := new(big.Float).SetInt(totalCombinations)
-	speedF := new(big.Float).SetInt(speed)
-	secondsF := new(big.Float).Quo(totalCombinationsF, speedF)
-	seconds, _ = secondsF.Float64()
-	minutes = seconds / 60
-	hours = minutes / 60
-	days = hours / 24
-	years = days / 365
-	return
-}
-
-// Funktion zum Durchsuchen einer Passwortliste
-func searchPasswordList(filename, target string, foundFlag *int32, testedCounter *int64) (bool, int) {
-	file, err := os.Open(filename)
-	if err != nil {
-		fmt.Println("Fehler beim Öffnen der Datei:", err)
-		return false, -1
-	}
-	defer file.Close()
-
-	reader := bufio.NewReader(file)
-	position := 0
-	startTime := time.Now()
-	for {
-		if atomic.LoadInt32(foundFlag) == 1 {
-			elapsedTime := time.Since(startTime).Seconds()
-			fmt.Printf("\nGeschätzte Zeit: %.2fs\n", elapsedTime)
-			fmt.Printf("Durchschnittliche Geschwindigkeit: %s Wörter/Sekunde\n", formatNumber(int64(float64(atomic.LoadInt64(testedCounter))/elapsedTime)))
-			return true, position
-		}
-		password, err := reader.ReadString('\n')
-		if err != nil {
-			break
-		}
-		password = strings.TrimSpace(password)
-		position++
-		atomic.AddInt64(testedCounter, 1)
-		if password == target {
-			atomic.StoreInt32(foundFlag, 1)
-			elapsedTime := time.Since(startTime).Seconds()
-			fmt.Printf("\nGeschätzte Zeit: %.2fs\n", elapsedTime)
-			fmt.Printf("Durchschnittliche Geschwindigkeit: %s Wörter/Sekunde\n", formatNumber(int64(float64(atomic.LoadInt64(testedCounter))/elapsedTime)))
-			return true, position
-		}
-	}
-
-	if err != nil {
-		fmt.Println("Fehler beim Lesen der Datei:", err)
-	}
-
-	return false, -1
-}
-
 func main() {
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Print("Zielpasswort: ")
 	target, _ := reader.ReadString('\n')
 	target = strings.TrimSpace(target)
-
-	fmt.Print("Möchten Sie eine Passwortliste verwenden? (ja/nein): ")
-	useList, _ := reader.ReadString('\n')
-	useList = strings.TrimSpace(strings.ToLower(useList))
-
-	var foundFlag int32 = 0
-	var testedCounter int64 = 0
-	if useList == "ja" {
-		fmt.Print("Dateiname der Passwortliste: ")
-		listFilename, _ := reader.ReadString('\n')
-		listFilename = strings.TrimSpace(listFilename)
-
-		found, position := searchPasswordList(listFilename, target, &foundFlag, &testedCounter)
-		if found {
-			fmt.Printf("Passwort in der Liste gefunden! Position: %d\n", position)
-			return
-		} else {
-			fmt.Println("Passwort nicht in der Liste gefunden.")
-		}
-	}
 
 	fmt.Println("\nZeichensatzauswahl:")
 	fmt.Println("1. Nur Zahlen")
@@ -196,22 +119,11 @@ func main() {
 		return
 	}
 
-	// Berechne die Gesamtzahl der möglichen Kombinationen für die maximale Länge
 	csLen := len(charset)
-	totalCombinations := totalForLength(maxLength, csLen)
-	fmt.Printf("Gesamtzahl der möglichen Kombinationen für eine Länge von %d: %s\n", maxLength, totalCombinations.String())
-
-	// Beispielgeschwindigkeit: 37 Millionen Passwörter pro Sekunde
-	speed := big.NewInt(37000000)
-	seconds, minutes, hours, days, years := calculateEstimatedTime(totalCombinations, speed)
-	fmt.Printf("Geschätzte Zeit für das Durchprobieren aller Kombinationen bei %d Passwörtern/Sekunde:\n", speed)
-	fmt.Printf("Sekunden: %.2f\n", seconds)
-	fmt.Printf("Minuten: %.2f\n", minutes)
-	fmt.Printf("Stunden: %.2f\n", hours)
-	fmt.Printf("Tage: %.2f\n", days)
-	fmt.Printf("Jahre: %.2f\n", years)
-
 	startTime := time.Now()
+	var foundFlag int32 = 0
+	var testedCounter int64 = 0
+
 	numCPU := runtime.NumCPU()
 	runtime.GOMAXPROCS(numCPU)
 
@@ -237,21 +149,21 @@ func main() {
 		}
 	}()
 
-	// Erzeuge Tasks für jede Passwortlänge, ohne sie auszugeben.
+	// Erzeuge Tasks für jede Passwortlänge.
 	for length := 1; length <= maxLength && atomic.LoadInt32(&foundFlag) == 0; length++ {
 		total := totalForLength(length, csLen)
 		// Bestimme die Chunk-Größe: maximal 10000 oder total/(10*numCPU), je nachdem, was größer ist.
 		chunkSize := 10000
-		temp := new(big.Int).Div(total, big.NewInt(int64(10*numCPU)))
-		if temp.Cmp(big.NewInt(int64(chunkSize))) == 1 {
-			chunkSize = int(temp.Int64())
+		temp := total / (10 * numCPU)
+		if temp > chunkSize {
+			chunkSize = temp
 		}
-		for start := int64(0); start < total.Int64() && atomic.LoadInt32(&foundFlag) == 0; start += int64(chunkSize) {
-			end := start + int64(chunkSize) - 1
-			if end >= total.Int64() {
-				end = total.Int64() - 1
+		for start := 0; start < total && atomic.LoadInt32(&foundFlag) == 0; start += chunkSize {
+			end := start + chunkSize - 1
+			if end >= total {
+				end = total - 1
 			}
-			tasks <- task{length: length, start: int(start), end: int(end)}
+			tasks <- task{length: length, start: start, end: end}
 		}
 	}
 	close(tasks)
