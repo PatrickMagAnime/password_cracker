@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"math/big"
 	"os"
@@ -16,23 +17,27 @@ import (
 )
 
 // Wandelt einen Index in ein Passwort der Länge 'length' um.
-func indexToPassword(idx int, charset []byte, length int) []byte {
-	password := make([]byte, length)
+func indexToPassword(idx int, charset []byte, length int, buffer []byte) {
 	csLen := len(charset)
 	for i := length - 1; i >= 0; i-- {
-		password[i] = charset[idx%csLen]
+		buffer[i] = charset[idx%csLen]
 		idx /= csLen
 	}
-	return password
 }
 
 // Berechnet die Gesamtzahl der Kombinationen für eine gegebene Länge.
+var totalCache = make(map[int]*big.Int)
+
 func totalForLength(length int, csLen int) *big.Int {
+	if total, exists := totalCache[length]; exists {
+		return total
+	}
 	total := big.NewInt(1)
 	csLenBig := big.NewInt(int64(csLen))
 	for i := 0; i < length; i++ {
 		total.Mul(total, csLenBig)
 	}
+	totalCache[length] = total
 	return total
 }
 
@@ -47,8 +52,8 @@ type task struct {
 func worker(tasks <-chan task, charset []byte, target []byte, foundFlag *int32, testedCounter *int64, foundPassword *[]byte, wg *sync.WaitGroup) {
 	defer wg.Done()
 	batchSize := 10000
+	buffer := make([]byte, len(target))
 	for t := range tasks {
-		// Falls das Passwort bereits gefunden wurde, Task überspringen.
 		if atomic.LoadInt32(foundFlag) == 1 {
 			continue
 		}
@@ -62,10 +67,10 @@ func worker(tasks <-chan task, charset []byte, target []byte, foundFlag *int32, 
 			}
 			atomic.AddInt64(testedCounter, int64(endBatch-idx+1))
 			for i := idx; i <= endBatch; i++ {
-				password := indexToPassword(i, charset, t.length)
-				if string(password) == string(target) {
+				indexToPassword(i, charset, t.length, buffer)
+				if bytes.Equal(buffer, target) {
 					atomic.StoreInt32(foundFlag, 1)
-					*foundPassword = password
+					*foundPassword = append([]byte(nil), buffer...)
 					return
 				}
 			}
@@ -77,6 +82,7 @@ func worker(tasks <-chan task, charset []byte, target []byte, foundFlag *int32, 
 func formatNumber(number int64) string {
 	in := strconv.FormatInt(number, 10)
 	out := strings.Builder{}
+	out.Grow(len(in) + (len(in)-1)/3) // Reserve space
 	for i, digit := range in {
 		if i > 0 && (len(in)-i)%3 == 0 {
 			out.WriteByte('.')
@@ -87,7 +93,7 @@ func formatNumber(number int64) string {
 }
 
 // Berechnet die geschätzte Zeit basierend auf der Anzahl der Kombinationen und der Geschwindigkeit
-func calculateEstimatedTime(totalCombinations, speed *big.Int) (seconds, minutes, hours, days, years float64) {
+func calculateEstimatedTime(totalCombinations, speed *big.Int) (seconds, minutes, hours, days, years, universes float64) {
 	totalCombinationsF := new(big.Float).SetInt(totalCombinations)
 	speedF := new(big.Float).SetInt(speed)
 	secondsF := new(big.Float).Quo(totalCombinationsF, speedF)
@@ -96,6 +102,7 @@ func calculateEstimatedTime(totalCombinations, speed *big.Int) (seconds, minutes
 	hours = minutes / 60
 	days = hours / 24
 	years = days / 365
+	universes = years / 13.8e9
 	return
 }
 
@@ -242,16 +249,17 @@ func main() {
 	// Berechne die Gesamtzahl der möglichen Kombinationen für die maximale Länge
 	csLen := len(charset)
 	totalCombinations := totalForLength(maxLength, csLen)
-	color.Cyan("Gesamtzahl der möglichen Kombinationen für eine Länge von %d: %s\n", maxLength, totalCombinations.String())
+	color.Cyan("Gesamtzahl der möglichen Kombinationen für eine Länge von %d: %s\n", maxLength, formatNumber(totalCombinations.Int64()))
 
-	// Beispielgeschwindigkeit: 37 Millionen Passwörter pro Sekunde
-	seconds, minutes, hours, days, years := calculateEstimatedTime(totalCombinations, speed)
-	color.Cyan("Geschätzte Zeit für das Durchprobieren aller Kombinationen bei %d Passwörtern/Sekunde:\n", speed)
+	// Beispielgeschwindigkeit: n Millionen Passwörter pro Sekunde
+	seconds, minutes, hours, days, years, universes := calculateEstimatedTime(totalCombinations, speed)
+	color.Cyan("Geschätzte Zeit für das Durchprobieren aller Kombinationen bei %s Passwörtern/Sekunde:\n", formatNumber(speed.Int64()))
 	color.Cyan("Sekunden: %.2f\n", seconds)
 	color.Cyan("Minuten: %.2f\n", minutes)
 	color.Cyan("Stunden: %.2f\n", hours)
 	color.Cyan("Tage: %.2f\n", days)
 	color.Cyan("Jahre: %.2f\n", years)
+	color.Cyan("Universen: %.10f\n", universes)
 
 	startTime := time.Now()
 	runtime.GOMAXPROCS(numCPU)
@@ -272,8 +280,8 @@ func main() {
 			case <-done:
 				return
 			default:
-				color.Cyan("\rGesamtfortschritt: %s Passwörter getestet", formatNumber(atomic.LoadInt64(&testedCounter)))
-				time.Sleep(1000 * time.Millisecond)
+				fmt.Printf("\rGesamtfortschritt: %s Passwörter getestet", formatNumber(atomic.LoadInt64(&testedCounter)))
+				time.Sleep(1 * time.Second)
 			}
 		}
 	}()
@@ -281,7 +289,6 @@ func main() {
 	// Erzeuge Tasks für jede Passwortlänge, ohne sie auszugeben.
 	for length := 1; length <= maxLength && atomic.LoadInt32(&foundFlag) == 0; length++ {
 		total := totalForLength(length, csLen)
-		// Bestimme die Chunk-Größe: maximal 10000 oder total/(10*numCPU), je nachdem, was größer ist.
 		chunkSize := 50000
 		temp := new(big.Int).Div(total, big.NewInt(int64(10*numCPU)))
 		if temp.Cmp(big.NewInt(int64(chunkSize))) == 1 {
@@ -310,3 +317,4 @@ func main() {
 		color.Red("Passwort nicht gefunden\n")
 	}
 }
+
